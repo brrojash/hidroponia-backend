@@ -1,0 +1,8 @@
+
+CREATE TABLE IF NOT EXISTS registros (
+  id SERIAL PRIMARY KEY,
+  fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  temperatura FLOAT,
+  humedad FLOAT,
+  bomba BOOLEAN
+);
