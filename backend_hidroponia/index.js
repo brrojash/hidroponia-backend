@@ -8,7 +8,7 @@ const port = process.env.PORT || 10000;
 app.use(cors());
 app.use(express.json());
 
-// Configuración de conexión PostgreSQL desde variable de entorno
+// 🔌 Conexión a PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
@@ -16,12 +16,12 @@ const pool = new Pool({
   },
 });
 
-// Ruta principal
+// 🌐 Ruta base
 app.get("/", (req, res) => {
-  res.send("API Hidroponía online");
+  res.send("✅ API Hidroponía funcionando");
 });
 
-// Endpoint para recibir datos desde la ESP32
+// 📤 POST /datos → recibe datos desde ESP32
 app.post("/datos", async (req, res) => {
   try {
     const { temperatura, humedad, bomba } = req.body;
@@ -42,27 +42,28 @@ app.post("/datos", async (req, res) => {
 
     res.status(200).json({ status: "ok" });
   } catch (error) {
-    console.error("Error al insertar datos:", error);
+    console.error("❌ Error al insertar datos:", error);
     res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
-// 🔍 GET /estado → Último registro
+// 🔍 GET /estado → Último control de bomba (con o sin datos)
 app.get("/estado", async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT * FROM registros
+      WHERE bomba IS NOT NULL
       ORDER BY fecha DESC
       LIMIT 1
     `);
     res.json(result.rows[0] || {});
   } catch (error) {
-    console.error("Error al obtener el estado:", error);
+    console.error("❌ Error al obtener el estado:", error);
     res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
-// 📊 GET /registros → Últimos 10 registros
+// 📊 GET /registros → Últimos 10 registros (datos + controles)
 app.get("/registros", async (req, res) => {
   try {
     const result = await pool.query(`
@@ -72,12 +73,12 @@ app.get("/registros", async (req, res) => {
     `);
     res.json(result.rows);
   } catch (error) {
-    console.error("Error al obtener registros:", error);
+    console.error("❌ Error al obtener registros:", error);
     res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
-// ⚡ POST /control → Cambiar estado de la bomba
+// ⚙️ POST /control → cambiar estado manual de la bomba
 app.post("/control", async (req, res) => {
   try {
     const { bomba } = req.body;
@@ -91,14 +92,15 @@ app.post("/control", async (req, res) => {
       VALUES (NULL, NULL, $1)
     `;
     await pool.query(query, [bomba]);
+
     res.json({ status: "bomba actualizada", estado: bomba });
   } catch (error) {
-    console.error("Error al cambiar estado de bomba:", error);
+    console.error("❌ Error al cambiar estado de bomba:", error);
     res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
-// Iniciar servidor
+// ▶️ Iniciar servidor
 app.listen(port, () => {
-  console.log(`Servidor escuchando en puerto ${port}`);
+  console.log(`🚀 Servidor escuchando en puerto ${port}`);
 });
