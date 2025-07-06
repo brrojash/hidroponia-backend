@@ -11,7 +11,9 @@ app.use(express.json());
 
 // 📦 Configuración de PostgreSQL desde Supabase
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || "postgresql://postgres:Bry%23%40n-2025Agro@db.sfwhafqwazaqoklwmsnh.supabase.co:5432/postgres",
+  connectionString:
+    process.env.DATABASE_URL ||
+    "postgresql://postgres:Bry%23%40n-2025Agro@db.sfwhafqwazaqoklwmsnh.supabase.co:5432/postgres",
   ssl: { rejectUnauthorized: false },
 });
 
@@ -32,14 +34,20 @@ app.post("/datos", async (req, res) => {
   }
 });
 
-// ✅ GET /estado => Último registro
+// ✅ GET /estado => Último registro real (no configuración)
 app.get("/estado", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM registros ORDER BY fecha DESC LIMIT 1`
+      `SELECT * FROM registros
+       WHERE temperatura IS NOT NULL
+         AND humedad IS NOT NULL
+         AND bomba IS NOT NULL
+       ORDER BY fecha DESC
+       LIMIT 1`
     );
     res.json(result.rows[0] || {});
   } catch (err) {
+    console.error("❌ Error al obtener estado:", err.message);
     res.status(500).json({ error: "Error al obtener estado" });
   }
 });
@@ -76,3 +84,4 @@ app.post("/control", async (req, res) => {
 app.listen(port, () => {
   console.log(`Servidor escuchando en puerto ${port}`);
 });
+//By Bryan R.
