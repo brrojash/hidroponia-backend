@@ -1,4 +1,3 @@
-// index.js (Backend completo)
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -17,7 +16,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ✅ POST /datos => Guarda sensor + estado bomba
+// ✅ POST /datos => Guarda datos del sensor y estado de la bomba
 app.post("/datos", async (req, res) => {
   const { temperatura, humedad, bomba } = req.body;
 
@@ -52,7 +51,7 @@ app.get("/estado", async (req, res) => {
   }
 });
 
-// ✅ GET /registros => Últimos 10 registros
+// ✅ GET /registros => Últimos 10 registros de sensores
 app.get("/registros", async (req, res) => {
   try {
     const result = await pool.query(
@@ -64,7 +63,7 @@ app.get("/registros", async (req, res) => {
   }
 });
 
-// ✅ POST /control => Guarda configuración de intervalos
+// ✅ POST /control => Guarda configuración de riego
 app.post("/control", async (req, res) => {
   const { intervalo_on, intervalo_off } = req.body;
 
@@ -81,7 +80,35 @@ app.post("/control", async (req, res) => {
   }
 });
 
-app.listen(port, () => {
-  console.log(`Servidor escuchando en puerto ${port}`);
+// ✅ POST /luces => Guarda evento de luces UV (manual o automático)
+app.post("/luces", async (req, res) => {
+  const { estado, modo, descripcion } = req.body;
+
+  try {
+    await pool.query(
+      `INSERT INTO luces_uv (estado, modo, descripcion)
+       VALUES ($1, $2, $3)`,
+      [estado, modo, descripcion]
+    );
+    res.status(200).json({ status: "luz_registrada" });
+  } catch (err) {
+    console.error("❌ Error al guardar evento de luz:", err.message);
+    res.status(500).json({ error: "Error al guardar evento de luz" });
+  }
 });
-//By Bryan R.
+
+// ✅ GET /luces => Últimos 10 eventos de luces
+app.get("/luces", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM luces_uv ORDER BY fecha DESC LIMIT 10`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: "Error al obtener eventos de luces" });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`🚀 Servidor escuchando en puerto ${port}`);
+});
