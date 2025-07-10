@@ -1,3 +1,4 @@
+// index.js
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -16,15 +17,21 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ✅ POST /datos => Guarda datos del sensor y estado de la bomba
+// ✅ POST /datos => Guarda datos del sensor y estado de la bomba y luces
 app.post("/datos", async (req, res) => {
-  const { temperatura, humedad, bomba } = req.body;
+  const { temperatura, humedad, bomba, luces } = req.body;
 
   try {
     await pool.query(
-      `INSERT INTO registros (temperatura, humedad, bomba, evento)
-       VALUES ($1, $2, $3, $4)`,
-      [temperatura, humedad, bomba, bomba ? "bomba_encendida" : "bomba_apagada"]
+      `INSERT INTO registros (temperatura, humedad, bomba, luces, evento)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        temperatura,
+        humedad,
+        bomba,
+        luces,
+        bomba ? "bomba_encendida" : "bomba_apagada",
+      ]
     );
     res.status(200).json({ status: "ok" });
   } catch (err) {
@@ -33,12 +40,14 @@ app.post("/datos", async (req, res) => {
   }
 });
 
-// ✅ GET /estado => Último registro real
+// ✅ GET /estado => Último registro real (no configuración)
 app.get("/estado", async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT * FROM registros
-       WHERE temperatura IS NOT NULL AND humedad IS NOT NULL AND bomba IS NOT NULL
+       WHERE temperatura IS NOT NULL
+         AND humedad IS NOT NULL
+         AND bomba IS NOT NULL
        ORDER BY fecha DESC
        LIMIT 1`
     );
@@ -49,7 +58,7 @@ app.get("/estado", async (req, res) => {
   }
 });
 
-// ✅ GET /registros => Últimos 10 registros
+// ✅ GET /registros => Últimos 10 registros de sensores
 app.get("/registros", async (req, res) => {
   try {
     const result = await pool.query(
@@ -78,15 +87,15 @@ app.post("/control", async (req, res) => {
   }
 });
 
-// ✅ POST /luces => Guarda evento de luces con hora exacta
+// ✅ POST /luces => Guarda evento de luces UV (manual o automático)
 app.post("/luces", async (req, res) => {
-  const { estado, modo, descripcion, hora_encendido, hora_apagado } = req.body;
+  const { estado, modo, descripcion } = req.body;
 
   try {
     await pool.query(
-      `INSERT INTO luces_uv (estado, modo, descripcion, hora_encendido, hora_apagado)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [estado, modo, descripcion, hora_encendido || null, hora_apagado || null]
+      `INSERT INTO luces_uv (estado, modo, descripcion)
+       VALUES ($1, $2, $3)`,
+      [estado, modo, descripcion]
     );
     res.status(200).json({ status: "luz_registrada" });
   } catch (err) {
@@ -95,7 +104,7 @@ app.post("/luces", async (req, res) => {
   }
 });
 
-// ✅ GET /luces => Últimos 10 eventos de luces UV
+// ✅ GET /luces => Últimos 10 eventos de luces
 app.get("/luces", async (req, res) => {
   try {
     const result = await pool.query(
@@ -107,7 +116,35 @@ app.get("/luces", async (req, res) => {
   }
 });
 
+// ✅ GET /luces/config => Devuelve la configuración actual de horario UV
+app.get("/luces/config", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM luces_config ORDER BY fecha DESC LIMIT 1`
+    );
+    res.json(result.rows[0] || {});
+  } catch (err) {
+    res.status(500).json({ error: "Error al obtener configuración de luces" });
+  }
+});
+
+// ✅ POST /luces/config => Guarda configuración de horario UV
+app.post("/luces/config", async (req, res) => {
+  const { hora_on, hora_off } = req.body;
+
+  try {
+    await pool.query(
+      `INSERT INTO luces_config (hora_on, hora_off)
+       VALUES ($1, $2)`,
+      [hora_on, hora_off]
+    );
+    res.status(200).json({ status: "config_luces_guardada" });
+  } catch (err) {
+    console.error("❌ Error al guardar configuración de luces:", err.message);
+    res.status(500).json({ error: "Error al guardar configuración de luces" });
+  }
+});
+
 app.listen(port, () => {
   console.log(`🚀 Servidor escuchando en puerto ${port}`);
 });
-// Bryan R.
