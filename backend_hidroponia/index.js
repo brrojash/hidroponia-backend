@@ -1,4 +1,3 @@
-// index.js
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -132,6 +131,15 @@ app.get("/luces/config", async (req, res) => {
 app.post("/luces/config", async (req, res) => {
   const { hora_on, hora_off } = req.body;
 
+  if (
+    typeof hora_on !== "number" ||
+    typeof hora_off !== "number" ||
+    hora_on < 0 || hora_on > 23 ||
+    hora_off < 0 || hora_off > 23
+  ) {
+    return res.status(400).json({ error: "Horas inválidas. Deben ser números entre 0 y 23." });
+  }
+
   try {
     await pool.query(
       `INSERT INTO luces_config (hora_on, hora_off)
@@ -145,6 +153,7 @@ app.post("/luces/config", async (req, res) => {
   }
 });
 
+// 🚀 Arrancar servidor
 app.listen(port, () => {
   console.log(`🚀 Servidor escuchando en puerto ${port}`);
 });
