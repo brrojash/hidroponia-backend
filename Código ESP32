@@ -1,0 +1,773 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <PubSubClient.h>
+#include "DHT.h"
+#include <ArduinoJson.h>
+#include <time.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// Configuración de pines
+#define DHTPIN 5          // DHT22 (reservado por si lo usas después)
+#define DHTTYPE DHT22
+#define DS18B20_PIN 14    // Nuevo sensor DS18B20
+#define BOMBA_PIN 4
+#define LUZ_PIN 18
+#define LCD_SDA 21        // Pin SDA para LCD I2C
+#define LCD_SCL 22        // Pin SCL para LCD I2C
+
+// Configuración de sensores y display
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
+DHT dht(DHTPIN, DHTTYPE);  // Mantener por si lo usas después
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // Dirección I2C 0x27, 16 columnas, 2 filas
+
+// WiFi y MQTT
+const char* ssid = "Familia Hernandez";
+const char* password = "3114468793";
+
+const char* mqtt_server = "7b5f22e684dc48709742e40ec59586b8.s1.eu.hivemq.cloud";
+const int mqtt_port = 8883;
+const char* mqtt_user = "esp32";
+const char* mqtt_pass = "Hidro1234";
+const char* mqtt_topic_sub = "hidroponia/control";
+const char* mqtt_topic_pub = "hidroponia/datos";
+
+// URLs del backend
+const char* backend_url = "https://hidroponia-backend.onrender.com/datos";
+const char* backend_luces = "https://hidroponia-backend.onrender.com/luces";
+const char* backend_registros = "https://hidroponia-backend.onrender.com/registros";
+const char* backend_luces_config = "https://hidroponia-backend.onrender.com/luces/config";
+
+WiFiClientSecure espClient;
+PubSubClient mqttClient(espClient);
+
+// Variables de estado
+bool bombaEncendida = false;
+bool luzEncendida = false;
+bool configRecibida = false;
+bool lucesConfigRecibida = false;
+bool modoAutomaticoActivo = true;
+bool intervencionManual = false;
+bool wifiConectado = false;
+bool mqttConectado = false;
+
+// Variables de tiempo
+unsigned long tiempoInicioCiclo = 0;
+unsigned long ultimoEnvio = 0;
+unsigned long ultimoCheckLuces = 0;
+unsigned long ultimoIntentoMQTT = 0;
+unsigned long ultimoWatchdog = 0;
+unsigned long ultimaActualizacionLCD = 0;
+
+// Configuración de intervalos
+const unsigned long intervaloDatos = 60000;
+const unsigned long intervaloLucesConfig = 5 * 60 * 1000;
+const unsigned long intervaloReconexionMQTT = 30000;
+const unsigned long intervaloWatchdog = 10000;
+const unsigned long intervaloLCD = 2000;  // Actualizar LCD cada 2 segundos
+
+int intervalo_on = 0;
+int intervalo_off = 0;
+int horaLuzOn = 22;
+int horaLuzOff = 2;
+int erroresConsecutivos = 0;
+int erroresMQTT = 0;
+const int MAX_ERRORES = 10;
+const int MAX_ERRORES_MQTT = 5;
+
+// Variables para sensores
+float temperaturaActual = 0.0;
+float humedadActual = 0.0;  // Para DHT22 si lo usas después
+bool sensorDS18B20OK = false;
+int pantallaModo = 0;  // Para rotar información en LCD
+
+enum EstadoBomba {
+  ESTADO_OFF,
+  ESTADO_ON
+};
+
+EstadoBomba estadoActual = ESTADO_OFF;
+
+// Declaraciones de funciones (para evitar errores de compilación)
+void mostrarEstadoCompleto();
+void encenderBomba();
+void apagarBomba();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+
+// Función para inicializar LCD
+void inicializarLCD() {
+  Wire.begin(LCD_SDA, LCD_SCL);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  
+  // Mensaje de inicio
+  lcd.setCursor(0, 0);
+  lcd.print("HIDROPONIA ESP32");
+  lcd.setCursor(0, 1);
+  lcd.print("Iniciando...");
+  
+  delay(3000);
+  Serial.println("✅ LCD inicializado");
+}
+
+// Función para actualizar información en LCD
+void actualizarLCD() {
+  if (millis() - ultimaActualizacionLCD < intervaloLCD) {
+    return;
+  }
+  
+  ultimaActualizacionLCD = millis();
+  lcd.clear();
+  
+  // Rotar entre diferentes pantallas cada 4 segundos
+  static unsigned long ultimoCambio = 0;
+  if (millis() - ultimoCambio >= 4000) {
+    ultimoCambio = millis();
+    pantallaModo = (pantallaModo + 1) % 5;  // 5 pantallas diferentes
+  }
+  
+  switch (pantallaModo) {
+    case 0:  // Pantalla principal - Estado del sistema
+      lcd.setCursor(0, 0);
+      lcd.print("AUTO ");
+      lcd.print(bombaEncendida ? "B:ON " : "B:OFF");
+      lcd.print(luzEncendida ? "L:ON" : "L:OFF");
+      
+      lcd.setCursor(0, 1);
+      if (sensorDS18B20OK) {
+        lcd.print("Temp: ");
+        lcd.print(temperaturaActual, 1);
+        lcd.print("C");
+      } else {
+        lcd.print("Temp: ERROR");
+      }
+      break;
+      
+    case 1:  // Pantalla de conectividad
+      lcd.setCursor(0, 0);
+      lcd.print("WiFi:");
+      lcd.print(wifiConectado ? "OK " : "ERR");
+      lcd.print(" MQTT:");
+      lcd.print(mqttConectado ? "OK" : "ERR");
+      
+      lcd.setCursor(0, 1);
+      lcd.print("IP:");
+      if (wifiConectado) {
+        String ip = WiFi.localIP().toString();
+        // Mostrar solo los últimos dígitos si es muy largo
+        if (ip.length() > 10) {
+          lcd.print(ip.substring(ip.length() - 10));
+        } else {
+          lcd.print(ip);
+        }
+      } else {
+        lcd.print("No conectado");
+      }
+      break;
+      
+    case 2:  // Pantalla de configuración
+      lcd.setCursor(0, 0);
+      lcd.print("Config: ");
+      lcd.print(configRecibida ? "OK" : "PEND");
+      
+      lcd.setCursor(0, 1);
+      lcd.print("ON:");
+      lcd.print(intervalo_on);
+      lcd.print("m OFF:");
+      lcd.print(intervalo_off);
+      lcd.print("m");
+      break;
+      
+    case 3:  // Pantalla de horarios de luz
+      lcd.setCursor(0, 0);
+      lcd.print("Luces UV:");
+      
+      lcd.setCursor(0, 1);
+      lcd.print(horaLuzOn);
+      lcd.print(":00 - ");
+      lcd.print(horaLuzOff);
+      lcd.print(":00");
+      break;
+      
+    case 4:  // Pantalla de tiempo y ciclos
+      lcd.setCursor(0, 0);
+      lcd.print("Estado: ");
+      lcd.print(estadoActual == ESTADO_ON ? "ON" : "OFF");
+      if (intervencionManual) {
+        lcd.print("(M)");
+      }
+      
+      unsigned long tiempoEnCiclo = millis() - tiempoInicioCiclo;
+      unsigned long tiempoLimite = estadoActual == ESTADO_ON ? 
+        (unsigned long)intervalo_on * 60000UL : (unsigned long)intervalo_off * 60000UL;
+      unsigned long tiempoRestante = tiempoLimite > tiempoEnCiclo ? tiempoLimite - tiempoEnCiclo : 0;
+      
+      lcd.setCursor(0, 1);
+      lcd.print("Rest: ");
+      lcd.print(tiempoRestante / 60000);
+      lcd.print(":");
+      int segundos = (tiempoRestante % 60000) / 1000;
+      if (segundos < 10) lcd.print("0");
+      lcd.print(segundos);
+      break;
+  }
+}
+
+// Función para mostrar mensaje temporal en LCD
+void mostrarMensajeTemporal(String linea1, String linea2 = "", int duracion = 2000) {
+  lcd.clear();
+  if (linea1.length() > 0) {
+    lcd.setCursor(0, 0);
+    // Truncar si es muy largo para 16 caracteres
+    if (linea1.length() > 16) {
+      lcd.print(linea1.substring(0, 16));
+    } else {
+      lcd.print(linea1);
+    }
+  }
+  if (linea2.length() > 0) {
+    lcd.setCursor(0, 1);
+    // Truncar si es muy largo para 16 caracteres
+    if (linea2.length() > 16) {
+      lcd.print(linea2.substring(0, 16));
+    } else {
+      lcd.print(linea2);
+    }
+  }
+  delay(duracion);
+}
+
+void conectarWiFi() {
+  mostrarMensajeTemporal("Conectando WiFi", ssid, 1000);
+  
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando a WiFi");
+  
+  int intentos = 0;
+  while (WiFi.status() != WL_CONNECTED && intentos < 20) {
+    delay(500);
+    Serial.print(".");
+    
+    // Actualizar LCD cada 2 intentos
+    if (intentos % 2 == 0) {
+      mostrarMensajeTemporal("Conectando WiFi", "Intento: " + String(intentos + 1) + "/20", 500);
+    }
+    intentos++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConectado = true;
+    Serial.println("\n✅ WiFi conectado");
+    Serial.println(WiFi.localIP());
+    
+    mostrarMensajeTemporal("WiFi CONECTADO!", WiFi.localIP().toString(), 2000);
+  } else {
+    wifiConectado = false;
+    Serial.println("\n❌ Error conectando WiFi");
+    mostrarMensajeTemporal("ERROR WiFi!", "Reiniciando...", 3000);
+    ESP.restart();
+  }
+}
+
+void configurarNTP() {
+  mostrarMensajeTemporal("Sincronizando", "hora NTP...", 1000);
+  
+  configTime(-5 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("⌛ Esperando hora NTP");
+  
+  int intentos = 0;
+  while (time(nullptr) < 100000 && intentos < 20) {
+    delay(500);
+    Serial.print(".");
+    
+    if (intentos % 4 == 0) {
+      mostrarMensajeTemporal("Sincronizando NTP", "Intento: " + String(intentos + 1) + "/20", 500);
+    }
+    intentos++;
+  }
+  
+  Serial.println("\n⏰ Hora NTP sincronizada");
+  mostrarMensajeTemporal("Hora NTP: OK", "", 1500);
+}
+
+// Función para leer temperatura DS18B20
+void leerTemperaturaDS18B20() {
+  ds18b20.requestTemperatures();
+  float temp = ds18b20.getTempCByIndex(0);
+  
+  if (temp != DEVICE_DISCONNECTED_C && temp > -50 && temp < 85) {
+    temperaturaActual = temp;
+    sensorDS18B20OK = true;
+    erroresConsecutivos = 0;
+  } else {
+    sensorDS18B20OK = false;
+    erroresConsecutivos++;
+    Serial.println("⚠️ Error leyendo DS18B20. Error " + String(erroresConsecutivos));
+    
+    if (erroresConsecutivos >= MAX_ERRORES) {
+      Serial.println("🔄 Reiniciando sensor DS18B20...");
+      ds18b20.begin();
+      erroresConsecutivos = 0;
+    }
+  }
+}
+
+void registrarEventoLuz(bool encendida, const char* modo, const char* descripcion) {
+  HTTPClient http;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(10000);
+
+  http.begin(client, backend_luces);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+
+  String payload = String("{\"estado\":") + (encendida ? "true" : "false") +
+                   ",\"modo\":\"" + modo + "\"" +
+                   ",\"descripcion\":\"" + descripcion + "\"}";
+
+  int httpCode = http.POST(payload);
+  if (httpCode > 0) {
+    Serial.println("📤 Evento luz registrado: " + payload);
+  } else {
+    Serial.println("❌ Error al registrar luz: " + String(httpCode));
+  }
+
+  http.end();
+}
+
+void obtenerConfigLuces() {
+  HTTPClient http;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(10000);
+
+  Serial.println("🔁 Obteniendo configuración luces...");
+  http.begin(client, backend_luces_config);
+  http.setTimeout(10000);
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(512);
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error) {
+      horaLuzOn = doc["hora_on"] | 22;
+      horaLuzOff = doc["hora_off"] | 2;
+      lucesConfigRecibida = true;
+      Serial.printf("✅ Horario luces: ON %02d:00 - OFF %02d:00\n", horaLuzOn, horaLuzOff);
+    } else {
+      Serial.println("❌ Error al parsear configuración de luces");
+    }
+  } else {
+    Serial.println("❌ Error HTTP al obtener config luces: " + String(httpCode));
+  }
+
+  http.end();
+}
+
+bool intentarConexionMQTT() {
+  if (millis() - ultimoIntentoMQTT < intervaloReconexionMQTT) {
+    return false;
+  }
+  
+  ultimoIntentoMQTT = millis();
+  espClient.setInsecure();
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+
+  Serial.print("⏳ Intentando conectar MQTT...");
+  if (mqttClient.connect("ESP32Client", mqtt_user, mqtt_pass)) {
+    Serial.println("✅ Conectado a MQTT");
+    mqttClient.subscribe(mqtt_topic_sub);
+    erroresMQTT = 0;
+    mqttConectado = true;
+    return true;
+  } else {
+    Serial.print("❌ Error MQTT: ");
+    Serial.println(mqttClient.state());
+    erroresMQTT++;
+    mqttConectado = false;
+    
+    if (erroresMQTT >= MAX_ERRORES_MQTT) {
+      Serial.println("🔄 Reiniciando WiFi por errores MQTT");
+      WiFi.disconnect();
+      delay(1000);
+      conectarWiFi();
+      erroresMQTT = 0;
+    }
+    return false;
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String comando;
+  for (int i = 0; i < length; i++) comando += (char)payload[i];
+  Serial.println("📩 Comando MQTT: " + comando);
+
+  if (comando == "on") {
+    encenderBomba();
+    intervencionManual = true;
+    estadoActual = ESTADO_ON;
+    tiempoInicioCiclo = millis();
+    Serial.println("🔧 Intervención manual: Bomba ON - Modo automático continúa");
+    mostrarMensajeTemporal("MQTT: Bomba ON", "Modo: Manual", 2000);
+  } 
+  else if (comando == "off") {
+    apagarBomba();
+    intervencionManual = true;
+    estadoActual = ESTADO_OFF;
+    tiempoInicioCiclo = millis();
+    Serial.println("🔧 Intervención manual: Bomba OFF - Modo automático continúa");
+    mostrarMensajeTemporal("MQTT: Bomba OFF", "Modo: Manual", 2000);
+  } 
+  else if (comando == "auto") {
+    intervencionManual = false;
+    estadoActual = bombaEncendida ? ESTADO_ON : ESTADO_OFF;
+    tiempoInicioCiclo = millis();
+    Serial.println("🤖 Ciclo automático reiniciado");
+    mostrarMensajeTemporal("MQTT: AUTOMATICO", "Ciclo reiniciado", 2000);
+  } 
+  else if (comando == "status") {
+    mostrarEstadoCompleto();
+  } 
+  else if (comando == "reset") {
+    Serial.println("🔄 Reiniciando sistema...");
+    mostrarMensajeTemporal("REINICIANDO...", "Por comando MQTT", 3000);
+    ESP.restart();
+  } 
+  else if (comando == "luces_on") {
+    digitalWrite(LUZ_PIN, LOW);
+    luzEncendida = true;
+    Serial.println("💡 Luces UV ENCENDIDAS (manual)");
+    registrarEventoLuz(true, "manual", "Encendidas por MQTT");
+    mostrarMensajeTemporal("MQTT: Luces ON", "Modo: Manual", 2000);
+  } 
+  else if (comando == "luces_off") {
+    digitalWrite(LUZ_PIN, HIGH);
+    luzEncendida = false;
+    Serial.println("🌑 Luces UV APAGADAS (manual)");
+    registrarEventoLuz(false, "manual", "Apagadas por MQTT");
+    mostrarMensajeTemporal("MQTT: Luces OFF", "Modo: Manual", 2000);
+  }
+}
+
+void encenderBomba() {
+  digitalWrite(BOMBA_PIN, LOW);
+  bombaEncendida = true;
+  Serial.println("🚰 Bomba ENCENDIDA");
+}
+
+void apagarBomba() {
+  digitalWrite(BOMBA_PIN, HIGH);
+  bombaEncendida = false;
+  Serial.println("💤 Bomba APAGADA");
+  
+  delay(100);
+  if (digitalRead(BOMBA_PIN) != HIGH) {
+    Serial.println("⚠️ ERROR: Pin de bomba no se actualizó correctamente");
+    digitalWrite(BOMBA_PIN, HIGH);
+  }
+}
+
+void mostrarEstadoCompleto() {
+  Serial.println("📊 ===== ESTADO COMPLETO =====");
+  Serial.printf("   Bomba física: %s\n", bombaEncendida ? "ENCENDIDA" : "APAGADA");
+  Serial.printf("   Estado automático: %s\n", estadoActual == ESTADO_ON ? "CICLO_ON" : "CICLO_OFF");
+  Serial.printf("   Modo: AUTOMÁTICO %s\n", intervencionManual ? "(con intervención)" : "(normal)");
+  Serial.printf("   Luces: %s\n", luzEncendida ? "ENCENDIDAS" : "APAGADAS");
+  Serial.printf("   Temperatura DS18B20: %.1f°C (%s)\n", temperaturaActual, sensorDS18B20OK ? "OK" : "ERROR");
+  Serial.printf("   Intervalos: ON=%d min, OFF=%d min\n", intervalo_on, intervalo_off);
+  Serial.printf("   Configuración: %s\n", configRecibida ? "RECIBIDA" : "PENDIENTE");
+  Serial.printf("   WiFi: %s\n", wifiConectado ? "CONECTADO" : "DESCONECTADO");
+  Serial.printf("   MQTT: %s\n", mqttConectado ? "CONECTADO" : "DESCONECTADO");
+  
+  unsigned long tiempoEnCiclo = millis() - tiempoInicioCiclo;
+  unsigned long tiempoLimite = estadoActual == ESTADO_ON ? 
+    (unsigned long)intervalo_on * 60000UL : (unsigned long)intervalo_off * 60000UL;
+  unsigned long tiempoRestante = tiempoLimite > tiempoEnCiclo ? tiempoLimite - tiempoEnCiclo : 0;
+  
+  Serial.printf("   Tiempo en ciclo: %lu segundos\n", tiempoEnCiclo / 1000);
+  Serial.printf("   Tiempo restante: %lu segundos\n", tiempoRestante / 1000);
+  Serial.println("=============================");
+}
+
+void enviarAlBackend(float t, bool bomba, bool luces) {
+  HTTPClient http;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(10000);
+
+  http.begin(client, backend_url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+
+  // Enviar solo temperatura del DS18B20, humedad en null o 0
+  String payload = String("{\"temperatura\":") + String(t, 1) +
+                   ",\"humedad\":0" +  // Puedes cambiarlo por null si prefieres
+                   ",\"bomba\":" + (bomba ? "true" : "false") +
+                   ",\"luces\":" + (luces ? "true" : "false") + "}";
+
+  int httpCode = http.POST(payload);
+  if (httpCode > 0) {
+    Serial.println("📤 Datos enviados: " + payload);
+  } else {
+    Serial.println("❌ Error HTTP POST: " + String(httpCode));
+  }
+
+  http.end();
+}
+
+void obtenerIntervalosDesdeBackend() {
+  mostrarMensajeTemporal("Obteniendo", "configuracion...", 1000);
+  
+  HTTPClient http;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15000);
+
+  for (int intento = 0; intento < 3 && !configRecibida; intento++) {
+    Serial.printf("🔁 Obteniendo configuración (intento %d)...\n", intento + 1);
+    
+    mostrarMensajeTemporal("Config intento", String(intento + 1) + "/3", 1000);
+
+    http.begin(client, backend_registros);
+    http.setTimeout(15000);
+    int httpCode = http.GET();
+    
+    if (httpCode == 200) {
+      String payload = http.getString();
+      DynamicJsonDocument doc(2048);
+      DeserializationError error = deserializeJson(doc, payload);
+
+      if (!error) {
+        for (JsonObject obj : doc.as<JsonArray>()) {
+          if (obj["evento"] == "configuracion_actualizada") {
+            int nuevo_on = obj["intervalo_on"];
+            int nuevo_off = obj["intervalo_off"];
+            
+            if (nuevo_on > 0 && nuevo_on <= 60 && nuevo_off > 0 && nuevo_off <= 1440) {
+              intervalo_on = nuevo_on;
+              intervalo_off = nuevo_off;
+              configRecibida = true;
+              Serial.printf("✅ Intervalos válidos: ON=%d min, OFF=%d min\n", intervalo_on, intervalo_off);
+            } else {
+              Serial.printf("⚠️ Intervalos inválidos: ON=%d, OFF=%d\n", nuevo_on, nuevo_off);
+            }
+            break;
+          }
+        }
+      }
+    } else {
+      Serial.println("❌ Error HTTP al obtener configuración: " + String(httpCode));
+    }
+
+    http.end();
+    delay(2000);
+  }
+
+  if (!configRecibida) {
+    Serial.println("⚠️ No se recibió configuración. Usando valores por defecto.");
+    intervalo_on = 5;
+    intervalo_off = 30;
+    configRecibida = true;
+    mostrarMensajeTemporal("Config defecto", "ON:5m OFF:30m", 2000);
+  } else {
+    mostrarMensajeTemporal("Config OK!", "ON:" + String(intervalo_on) + "m OFF:" + String(intervalo_off) + "m", 2000);
+  }
+}
+
+void controlarBombaAutomatica() {
+  if (!configRecibida) {
+    return;
+  }
+
+  unsigned long ahora = millis();
+  unsigned long tiempoEnCiclo = ahora - tiempoInicioCiclo;
+  unsigned long tiempoOnMs = (unsigned long)intervalo_on * 60000UL;
+  unsigned long tiempoOffMs = (unsigned long)intervalo_off * 60000UL;
+
+  if (tiempoOnMs < 60000UL || tiempoOffMs < 60000UL) {
+    Serial.println("⚠️ Error en cálculo de intervalos");
+    return;
+  }
+
+  static unsigned long ultimoDebugDetallado = 0;
+  if (ahora - ultimoDebugDetallado >= 30000) {
+    ultimoDebugDetallado = ahora;
+    Serial.printf("🔍 AUTO: Estado=%s, TiempoEnCiclo=%lu/%lu ms, Intervención=%s\n", 
+                  estadoActual == ESTADO_ON ? "ON" : "OFF",
+                  tiempoEnCiclo, 
+                  estadoActual == ESTADO_ON ? tiempoOnMs : tiempoOffMs,
+                  intervencionManual ? "SI" : "NO");
+  }
+
+  switch (estadoActual) {
+    case ESTADO_OFF:
+      if (tiempoEnCiclo >= tiempoOffMs) {
+        Serial.printf("🔄 AUTO: OFF->ON después de %d min\n", intervalo_off);
+        encenderBomba();
+        estadoActual = ESTADO_ON;
+        tiempoInicioCiclo = ahora;
+        intervencionManual = false;
+      }
+      break;
+      
+    case ESTADO_ON:
+      if (tiempoEnCiclo >= tiempoOnMs) {
+        Serial.printf("🔄 AUTO: ON->OFF después de %d min\n", intervalo_on);
+        apagarBomba();
+        estadoActual = ESTADO_OFF;
+        tiempoInicioCiclo = ahora;
+        intervencionManual = false;
+        
+        if (digitalRead(BOMBA_PIN) != HIGH) {
+          Serial.println("⚠️ ERROR: Forzando apagado de bomba");
+          digitalWrite(BOMBA_PIN, HIGH);
+          bombaEncendida = false;
+        }
+      }
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Inicializar LCD primero
+  inicializarLCD();
+  
+  // Configurar pines
+  pinMode(BOMBA_PIN, OUTPUT);
+  digitalWrite(BOMBA_PIN, HIGH);  // Bomba apagada
+  pinMode(LUZ_PIN, OUTPUT);
+  digitalWrite(LUZ_PIN, HIGH);    // Luces apagadas
+
+  // Inicializar sensores
+  ds18b20.begin();
+  dht.begin();  // Mantener por si lo usas después
+  
+  Serial.println("🚀 Iniciando sistema hidropónico - MODO AUTOMÁTICO PERMANENTE");
+  mostrarMensajeTemporal("Iniciando", "Modo: AUTO", 2000);
+  
+  conectarWiFi();
+  configurarNTP();
+  obtenerIntervalosDesdeBackend();
+  obtenerConfigLuces();
+  
+  // Inicialización del sistema
+  tiempoInicioCiclo = millis();
+  estadoActual = ESTADO_OFF;
+  modoAutomaticoActivo = true;
+  intervencionManual = false;
+  
+  intentarConexionMQTT();
+  
+  Serial.println("✅ Sistema inicializado - MODO AUTOMÁTICO ACTIVO");
+  mostrarMensajeTemporal("Sistema listo!", "Modo: AUTO", 2000);
+  mostrarEstadoCompleto();
+}
+
+void loop() {
+  unsigned long ahora = millis();
+  
+  // Actualizar estado de conexiones
+  wifiConectado = (WiFi.status() == WL_CONNECTED);
+  
+  // Watchdog simplificado
+  if (ahora - ultimoWatchdog >= intervaloWatchdog) {
+    ultimoWatchdog = ahora;
+    
+    Serial.printf("⏰ [%lu] Bomba:%s Estado:%s Tiempo:%lus %s Temp:%.1f°C\n", 
+                  ahora/1000, 
+                  bombaEncendida ? "ON" : "OFF",
+                  estadoActual == ESTADO_ON ? "CICLO_ON" : "CICLO_OFF",
+                  (ahora - tiempoInicioCiclo)/1000,
+                  intervencionManual ? "(Manual)" : "(Auto)",
+                  temperaturaActual);
+  }
+
+  // Mantener conexión MQTT
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+    mqttConectado = true;
+  } else {
+    mqttConectado = false;
+    intentarConexionMQTT();
+  }
+
+  // Control principal: Siempre ejecutar el control automático
+  controlarBombaAutomatica();
+
+  // Leer sensores y enviar datos
+  if (ahora - ultimoEnvio >= intervaloDatos) {
+    ultimoEnvio = ahora;
+    
+    // Leer temperatura DS18B20
+    leerTemperaturaDS18B20();
+    
+    // Opcional: leer DHT22 si está conectado (para futuro uso)
+    // float h = dht.readHumidity();
+    // if (!isnan(h) && h >= 0 && h <= 100) {
+    //   humedadActual = h;
+    // }
+
+    if (sensorDS18B20OK) {
+      erroresConsecutivos = 0;
+      
+      if (mqttClient.connected()) {
+        String mensaje = String("{\"temperatura\":") + String(temperaturaActual, 1) +
+                         ",\"humedad\":0" +  // Cambiar si usas DHT22: String(humedadActual, 1)
+                         ",\"bomba\":" + (bombaEncendida ? "true" : "false") +
+                         ",\"luces\":" + (luzEncendida ? "true" : "false") + "}";
+        mqttClient.publish(mqtt_topic_pub, mensaje.c_str());
+        Serial.println("📤 MQTT: " + mensaje);
+      }
+      
+      enviarAlBackend(temperaturaActual, bombaEncendida, luzEncendida);
+    }
+  }
+
+  // Actualizar configuración de luces periódicamente
+  if (ahora - ultimoCheckLuces >= intervaloLucesConfig) {
+    obtenerConfigLuces();
+    ultimoCheckLuces = ahora;
+  }
+
+  // Control automático de luces UV
+  if (lucesConfigRecibida) {
+    time_t now = time(nullptr);
+    struct tm* timeinfo = localtime(&now);
+    int hora = timeinfo->tm_hour;
+
+    bool debeEstarEncendida = false;
+    if (horaLuzOn <= horaLuzOff) {
+      debeEstarEncendida = (hora >= horaLuzOn && hora < horaLuzOff);
+    } else {
+      debeEstarEncendida = (hora >= horaLuzOn || hora < horaLuzOff);
+    }
+
+    if (debeEstarEncendida && !luzEncendida) {
+      digitalWrite(LUZ_PIN, LOW);
+      luzEncendida = true;
+      Serial.println("🌙 Luces UV ENCENDIDAS (auto)");
+      registrarEventoLuz(true, "auto", "Encendidas por horario");
+    } else if (!debeEstarEncendida && luzEncendida) {
+      digitalWrite(LUZ_PIN, HIGH);
+      luzEncendida = false;
+      Serial.println("🌤️ Luces UV APAGADAS (auto)");
+      registrarEventoLuz(false, "auto", "Apagadas por horario");
+    }
+  }
+
+  // Actualizar LCD
+  actualizarLCD();
+
+  delay(100);
+}
