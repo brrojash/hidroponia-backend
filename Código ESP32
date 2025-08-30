@@ -11,13 +11,14 @@
 #include <DallasTemperature.h>
 
 // Configuración de pines
-#define DHTPIN 5          // DHT22 (reservado por si lo usas después)
+#define DHTPIN 15          // DHT22 (reservado por si lo usas después)
 #define DHTTYPE DHT22
 #define DS18B20_PIN 14    // Nuevo sensor DS18B20
 #define BOMBA_PIN 4
 #define LUZ_PIN 18
 #define LCD_SDA 21        // Pin SDA para LCD I2C
 #define LCD_SCL 22        // Pin SCL para LCD I2C
+#define BOTON_LCD 5      // Pin del botón para encender/apagar LCD
 
 // Configuración de sensores y display
 OneWire oneWire(DS18B20_PIN);
@@ -26,8 +27,8 @@ DHT dht(DHTPIN, DHTTYPE);  // Mantener por si lo usas después
 LiquidCrystal_I2C lcd(0x27, 16, 2);  // Dirección I2C 0x27, 16 columnas, 2 filas
 
 // WiFi y MQTT
-const char* ssid = "Familia Hernandez";
-const char* password = "3114468793";
+const char* ssid = "Esperanza";
+const char* password = "Cuarto4Piso#";
 
 const char* mqtt_server = "7b5f22e684dc48709742e40ec59586b8.s1.eu.hivemq.cloud";
 const int mqtt_port = 8883;
@@ -54,6 +55,7 @@ bool modoAutomaticoActivo = true;
 bool intervencionManual = false;
 bool wifiConectado = false;
 bool mqttConectado = false;
+bool lcdEncendido = true;  // Variable para controlar el estado del LCD
 
 // Variables de tiempo
 unsigned long tiempoInicioCiclo = 0;
@@ -62,6 +64,7 @@ unsigned long ultimoCheckLuces = 0;
 unsigned long ultimoIntentoMQTT = 0;
 unsigned long ultimoWatchdog = 0;
 unsigned long ultimaActualizacionLCD = 0;
+unsigned long ultimaLecturaBoton = 0;
 
 // Configuración de intervalos
 const unsigned long intervaloDatos = 60000;
@@ -76,8 +79,10 @@ int horaLuzOn = 22;
 int horaLuzOff = 2;
 int erroresConsecutivos = 0;
 int erroresMQTT = 0;
+int reiniciosWiFi = 0;
 const int MAX_ERRORES = 10;
 const int MAX_ERRORES_MQTT = 5;
+const int MAX_REINICIO_WIFI = 3;
 
 // Variables para sensores
 float temperaturaActual = 0.0;
@@ -98,8 +103,68 @@ void encenderBomba();
 void apagarBomba();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 
+// Función para manejar el botón del LCD con antirrebote mejorado
+void manejarBotonLCD() {
+  // Solo verificar el botón cada 50ms para evitar lecturas excesivas
+  if (millis() - ultimaLecturaBoton < 50) {
+    return;
+  }
+  ultimaLecturaBoton = millis();
+  
+  static bool estadoBotonAnterior = HIGH;
+  static unsigned long tiempoUltimoCambio = 0;
+  static bool botonPresionado = false;
+  
+  bool estadoBotonActual = digitalRead(BOTON_LCD);
+  
+  // Detectar cambio de estado
+  if (estadoBotonActual != estadoBotonAnterior) {
+    tiempoUltimoCambio = millis();
+  }
+  
+  // Antirrebote: verificar que el estado se mantenga por al menos 50ms
+  if ((millis() - tiempoUltimoCambio) > 50) {
+    // Si el botón cambió a presionado (LOW) y no estaba presionado
+    if (estadoBotonActual == LOW && !botonPresionado) {
+      botonPresionado = true;
+      
+      // Cambiar estado del LCD
+      lcdEncendido = !lcdEncendido;
+      
+      if (lcdEncendido) {
+        lcd.backlight();
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("LCD ENCENDIDO");
+        lcd.setCursor(0, 1);
+        lcd.print("Sistema activo");
+        Serial.println("📺 LCD ENCENDIDO por botón");
+        delay(1500);
+      } else {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("LCD APAGADO");
+        lcd.setCursor(0, 1);
+        lcd.print("Presiona boton");
+        delay(1500);
+        lcd.noBacklight();
+        Serial.println("📺 LCD APAGADO por botón");
+      }
+    }
+    
+    // Si el botón se soltó (HIGH)
+    if (estadoBotonActual == HIGH && botonPresionado) {
+      botonPresionado = false;
+    }
+  }
+  
+  estadoBotonAnterior = estadoBotonActual;
+}
+
 // Función para inicializar LCD
 void inicializarLCD() {
+  pinMode(BOTON_LCD, INPUT_PULLUP); // Configurar botón con pull-up interno
+  
   Wire.begin(LCD_SDA, LCD_SCL);
   lcd.init();
   lcd.backlight();
@@ -111,12 +176,23 @@ void inicializarLCD() {
   lcd.setCursor(0, 1);
   lcd.print("Iniciando...");
   
+  // Verificar botón
+  Serial.println("📺 Probando botón LCD...");
+  bool botonOK = digitalRead(BOTON_LCD);
+  Serial.printf("📺 Estado inicial botón: %s\n", botonOK ? "HIGH (OK)" : "LOW (presionado)");
+  
   delay(3000);
   Serial.println("✅ LCD inicializado");
+  Serial.println("📺 Botón LCD configurado en GPIO15");
 }
 
-// Función para actualizar información en LCD
+// Función para actualizar información en LCD (solo si está encendido)
 void actualizarLCD() {
+  // Solo actualizar si el LCD está encendido
+  if (!lcdEncendido) {
+    return;
+  }
+  
   if (millis() - ultimaActualizacionLCD < intervaloLCD) {
     return;
   }
@@ -218,8 +294,12 @@ void actualizarLCD() {
   }
 }
 
-// Función para mostrar mensaje temporal en LCD
+// Función para mostrar mensaje temporal en LCD (solo si está encendido)
 void mostrarMensajeTemporal(String linea1, String linea2 = "", int duracion = 2000) {
+  if (!lcdEncendido) {
+    return; // No mostrar si el LCD está apagado
+  }
+  
   lcd.clear();
   if (linea1.length() > 0) {
     lcd.setCursor(0, 0);
@@ -245,36 +325,71 @@ void mostrarMensajeTemporal(String linea1, String linea2 = "", int duracion = 20
 void conectarWiFi() {
   mostrarMensajeTemporal("Conectando WiFi", ssid, 1000);
   
+  // Configuración WiFi más robusta
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  
+  // Intentar diferentes configuraciones si falla
   WiFi.begin(ssid, password);
   Serial.print("Conectando a WiFi");
+  Serial.printf(" (%s)", ssid);
   
   int intentos = 0;
-  while (WiFi.status() != WL_CONNECTED && intentos < 20) {
-    delay(500);
+  while (WiFi.status() != WL_CONNECTED && intentos < 30) { // Aumentado a 30 intentos
+    delay(1000); // Aumentado a 1 segundo por intento
     Serial.print(".");
     
-    // Actualizar LCD cada 2 intentos
-    if (intentos % 2 == 0) {
-      mostrarMensajeTemporal("Conectando WiFi", "Intento: " + String(intentos + 1) + "/20", 500);
+    // Actualizar LCD cada 3 intentos
+    if (intentos % 3 == 0) {
+      mostrarMensajeTemporal("Conectando WiFi", "Intento: " + String(intentos + 1) + "/30", 800);
     }
+    
+    // Reintentar con configuración diferente cada 10 intentos
+    if (intentos % 10 == 9 && intentos > 0) {
+      Serial.println("\n🔄 Reintentando conexión WiFi...");
+      WiFi.disconnect();
+      delay(2000);
+      WiFi.begin(ssid, password);
+      mostrarMensajeTemporal("Reintentando", "WiFi config...", 1000);
+    }
+    
     intentos++;
   }
   
   if (WiFi.status() == WL_CONNECTED) {
     wifiConectado = true;
+    reiniciosWiFi = 0; // Resetear contador de reinicies
     Serial.println("\n✅ WiFi conectado");
-    Serial.println(WiFi.localIP());
+    Serial.printf("   IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("   RSSI: %d dBm\n", WiFi.RSSI());
     
     mostrarMensajeTemporal("WiFi CONECTADO!", WiFi.localIP().toString(), 2000);
   } else {
     wifiConectado = false;
+    reiniciosWiFi++;
     Serial.println("\n❌ Error conectando WiFi");
-    mostrarMensajeTemporal("ERROR WiFi!", "Reiniciando...", 3000);
-    ESP.restart();
+    Serial.printf("   Reinicio #%d\n", reiniciosWiFi);
+    
+    if (reiniciosWiFi >= MAX_REINICIO_WIFI) {
+      Serial.println("🚨 MODO SIN INTERNET - Continuando sin WiFi");
+      mostrarMensajeTemporal("MODO OFFLINE", "Sin conexion", 3000);
+      // NO reiniciar el ESP32, continuar sin internet
+      return;
+    } else {
+      mostrarMensajeTemporal("ERROR WiFi!", "Reintentando...", 3000);
+      delay(5000);
+      conectarWiFi(); // Reintentar recursivamente
+    }
   }
 }
 
 void configurarNTP() {
+  if (!wifiConectado) {
+    Serial.println("⚠️ Sin WiFi - Saltando configuración NTP");
+    return;
+  }
+  
   mostrarMensajeTemporal("Sincronizando", "hora NTP...", 1000);
   
   configTime(-5 * 3600, 0, "pool.ntp.org", "time.nist.gov");
@@ -291,8 +406,13 @@ void configurarNTP() {
     intentos++;
   }
   
-  Serial.println("\n⏰ Hora NTP sincronizada");
-  mostrarMensajeTemporal("Hora NTP: OK", "", 1500);
+  if (time(nullptr) > 100000) {
+    Serial.println("\n⏰ Hora NTP sincronizada");
+    mostrarMensajeTemporal("Hora NTP: OK", "", 1500);
+  } else {
+    Serial.println("\n⚠️ No se pudo sincronizar NTP");
+    mostrarMensajeTemporal("NTP: ERROR", "Continuando...", 1500);
+  }
 }
 
 // Función para leer temperatura DS18B20
@@ -318,6 +438,11 @@ void leerTemperaturaDS18B20() {
 }
 
 void registrarEventoLuz(bool encendida, const char* modo, const char* descripcion) {
+  if (!wifiConectado) {
+    Serial.printf("⚠️ Sin WiFi - No se puede registrar evento luz: %s\n", descripcion);
+    return;
+  }
+  
   HTTPClient http;
   WiFiClientSecure client;
   client.setInsecure();
@@ -342,6 +467,11 @@ void registrarEventoLuz(bool encendida, const char* modo, const char* descripcio
 }
 
 void obtenerConfigLuces() {
+  if (!wifiConectado) {
+    Serial.println("⚠️ Sin WiFi - Usando configuración de luces por defecto");
+    return;
+  }
+  
   HTTPClient http;
   WiFiClientSecure client;
   client.setInsecure();
@@ -373,6 +503,10 @@ void obtenerConfigLuces() {
 }
 
 bool intentarConexionMQTT() {
+  if (!wifiConectado) {
+    return false; // No intentar MQTT sin WiFi
+  }
+  
   if (millis() - ultimoIntentoMQTT < intervaloReconexionMQTT) {
     return false;
   }
@@ -396,11 +530,8 @@ bool intentarConexionMQTT() {
     mqttConectado = false;
     
     if (erroresMQTT >= MAX_ERRORES_MQTT) {
-      Serial.println("🔄 Reiniciando WiFi por errores MQTT");
-      WiFi.disconnect();
-      delay(1000);
-      conectarWiFi();
-      erroresMQTT = 0;
+      Serial.println("🔄 Problemas MQTT persistentes - Continuando sin MQTT");
+      erroresMQTT = 0; // Resetear para intentar más tarde
     }
     return false;
   }
@@ -456,6 +587,38 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     registrarEventoLuz(false, "manual", "Apagadas por MQTT");
     mostrarMensajeTemporal("MQTT: Luces OFF", "Modo: Manual", 2000);
   }
+  else if (comando == "lcd_on") {
+    if (!lcdEncendido) {
+      lcdEncendido = true;
+      lcd.backlight();
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("LCD ENCENDIDO");
+      lcd.setCursor(0, 1);
+      lcd.print("Por comando MQTT");
+      Serial.println("📺 LCD ENCENDIDO por MQTT");
+      delay(2000);
+    }
+  }
+  else if (comando == "lcd_off") {
+    if (lcdEncendido) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("LCD APAGADO");
+      lcd.setCursor(0, 1);
+      lcd.print("Por comando MQTT");
+      delay(2000);
+      lcd.noBacklight();
+      lcdEncendido = false;
+      Serial.println("📺 LCD APAGADO por MQTT");
+    }
+  }
+  else if (comando == "test_boton") {
+    Serial.printf("🔧 Test botón - Estado actual: %s, LCD: %s\n", 
+                  digitalRead(BOTON_LCD) ? "HIGH" : "LOW",
+                  lcdEncendido ? "ON" : "OFF");
+    mostrarMensajeTemporal("Test boton OK", "Estado reportado", 2000);
+  }
 }
 
 void encenderBomba() {
@@ -482,11 +645,18 @@ void mostrarEstadoCompleto() {
   Serial.printf("   Estado automático: %s\n", estadoActual == ESTADO_ON ? "CICLO_ON" : "CICLO_OFF");
   Serial.printf("   Modo: AUTOMÁTICO %s\n", intervencionManual ? "(con intervención)" : "(normal)");
   Serial.printf("   Luces: %s\n", luzEncendida ? "ENCENDIDAS" : "APAGADAS");
+  Serial.printf("   LCD: %s\n", lcdEncendido ? "ENCENDIDO" : "APAGADO");
+  Serial.printf("   Botón LCD (GPIO15): %s\n", digitalRead(BOTON_LCD) ? "HIGH" : "LOW");
   Serial.printf("   Temperatura DS18B20: %.1f°C (%s)\n", temperaturaActual, sensorDS18B20OK ? "OK" : "ERROR");
   Serial.printf("   Intervalos: ON=%d min, OFF=%d min\n", intervalo_on, intervalo_off);
   Serial.printf("   Configuración: %s\n", configRecibida ? "RECIBIDA" : "PENDIENTE");
-  Serial.printf("   WiFi: %s\n", wifiConectado ? "CONECTADO" : "DESCONECTADO");
+  Serial.printf("   WiFi: %s (%d reinicies)\n", wifiConectado ? "CONECTADO" : "DESCONECTADO", reiniciosWiFi);
   Serial.printf("   MQTT: %s\n", mqttConectado ? "CONECTADO" : "DESCONECTADO");
+  
+  if (wifiConectado) {
+    Serial.printf("   RSSI: %d dBm\n", WiFi.RSSI());
+    Serial.printf("   IP: %s\n", WiFi.localIP().toString().c_str());
+  }
   
   unsigned long tiempoEnCiclo = millis() - tiempoInicioCiclo;
   unsigned long tiempoLimite = estadoActual == ESTADO_ON ? 
@@ -499,6 +669,11 @@ void mostrarEstadoCompleto() {
 }
 
 void enviarAlBackend(float t, bool bomba, bool luces) {
+  if (!wifiConectado) {
+    Serial.println("⚠️ Sin WiFi - No se pueden enviar datos al backend");
+    return;
+  }
+  
   HTTPClient http;
   WiFiClientSecure client;
   client.setInsecure();
@@ -525,6 +700,15 @@ void enviarAlBackend(float t, bool bomba, bool luces) {
 }
 
 void obtenerIntervalosDesdeBackend() {
+  if (!wifiConectado) {
+    Serial.println("⚠️ Sin WiFi - Usando configuración por defecto");
+    intervalo_on = 5;
+    intervalo_off = 30;
+    configRecibida = true;
+    mostrarMensajeTemporal("Config defecto", "ON:5m OFF:30m", 2000);
+    return;
+  }
+  
   mostrarMensajeTemporal("Obteniendo", "configuracion...", 1000);
   
   HTTPClient http;
@@ -639,8 +823,9 @@ void controlarBombaAutomatica() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("\n🚀 ===== INICIANDO SISTEMA HIDROPÓNICO =====");
   
-  // Inicializar LCD primero
+  // Inicializar LCD primero (incluye configuración del botón)
   inicializarLCD();
   
   // Configurar pines
@@ -654,12 +839,30 @@ void setup() {
   dht.begin();  // Mantener por si lo usas después
   
   Serial.println("🚀 Iniciando sistema hidropónico - MODO AUTOMÁTICO PERMANENTE");
+  Serial.println("📺 Botón LCD en GPIO15 - Presiona para encender/apagar pantalla");
+  Serial.println("🌐 Intentando conectar a internet...");
   mostrarMensajeTemporal("Iniciando", "Modo: AUTO", 2000);
   
+  // Intentar conectar WiFi (sin reiniciar si falla)
   conectarWiFi();
-  configurarNTP();
-  obtenerIntervalosDesdeBackend();
-  obtenerConfigLuces();
+  
+  // Continuar con el setup incluso sin WiFi
+  if (wifiConectado) {
+    configurarNTP();
+    obtenerIntervalosDesdeBackend();
+    obtenerConfigLuces();
+    intentarConexionMQTT();
+  } else {
+    // Configurar valores por defecto sin internet
+    intervalo_on = 5;
+    intervalo_off = 30;
+    configRecibida = true;
+    horaLuzOn = 22;
+    horaLuzOff = 2;
+    lucesConfigRecibida = true;
+    Serial.println("⚠️ MODO OFFLINE - Usando configuración por defecto");
+    mostrarMensajeTemporal("MODO OFFLINE", "Config defecto", 2000);
+  }
   
   // Inicialización del sistema
   tiempoInicioCiclo = millis();
@@ -667,15 +870,26 @@ void setup() {
   modoAutomaticoActivo = true;
   intervencionManual = false;
   
-  intentarConexionMQTT();
-  
   Serial.println("✅ Sistema inicializado - MODO AUTOMÁTICO ACTIVO");
-  mostrarMensajeTemporal("Sistema listo!", "Modo: AUTO", 2000);
+  if (wifiConectado) {
+    mostrarMensajeTemporal("Sistema listo!", "Online - Boton:15", 2000);
+  } else {
+    mostrarMensajeTemporal("Sistema listo!", "Offline - Boton:15", 2000);
+  }
+  
   mostrarEstadoCompleto();
+  
+  Serial.println("📺 INSTRUCCIONES BOTÓN:");
+  Serial.println("   - Conecta un botón entre GPIO15 y GND");
+  Serial.println("   - Presiona para encender/apagar el LCD");
+  Serial.println("   - Comando MQTT 'test_boton' para probar");
 }
 
 void loop() {
   unsigned long ahora = millis();
+  
+  // PRIMERA PRIORIDAD: Manejar botón del LCD
+  manejarBotonLCD();
   
   // Actualizar estado de conexiones
   wifiConectado = (WiFi.status() == WL_CONNECTED);
@@ -684,22 +898,26 @@ void loop() {
   if (ahora - ultimoWatchdog >= intervaloWatchdog) {
     ultimoWatchdog = ahora;
     
-    Serial.printf("⏰ [%lu] Bomba:%s Estado:%s Tiempo:%lus %s Temp:%.1f°C\n", 
+    Serial.printf("⏰ [%lu] Bomba:%s Estado:%s Tiempo:%lus %s Temp:%.1f°C LCD:%s WiFi:%s\n", 
                   ahora/1000, 
                   bombaEncendida ? "ON" : "OFF",
                   estadoActual == ESTADO_ON ? "CICLO_ON" : "CICLO_OFF",
                   (ahora - tiempoInicioCiclo)/1000,
                   intervencionManual ? "(Manual)" : "(Auto)",
-                  temperaturaActual);
+                  temperaturaActual,
+                  lcdEncendido ? "ON" : "OFF",
+                  wifiConectado ? "OK" : "ERR");
   }
 
-  // Mantener conexión MQTT
-  if (mqttClient.connected()) {
-    mqttClient.loop();
-    mqttConectado = true;
-  } else {
-    mqttConectado = false;
-    intentarConexionMQTT();
+  // Mantener conexión MQTT (solo si hay WiFi)
+  if (wifiConectado) {
+    if (mqttClient.connected()) {
+      mqttClient.loop();
+      mqttConectado = true;
+    } else {
+      mqttConectado = false;
+      intentarConexionMQTT();
+    }
   }
 
   // Control principal: Siempre ejecutar el control automático
@@ -721,52 +939,60 @@ void loop() {
     if (sensorDS18B20OK) {
       erroresConsecutivos = 0;
       
-      if (mqttClient.connected()) {
+      // Solo enviar por MQTT si está conectado
+      if (wifiConectado && mqttClient.connected()) {
         String mensaje = String("{\"temperatura\":") + String(temperaturaActual, 1) +
                          ",\"humedad\":0" +  // Cambiar si usas DHT22: String(humedadActual, 1)
                          ",\"bomba\":" + (bombaEncendida ? "true" : "false") +
-                         ",\"luces\":" + (luzEncendida ? "true" : "false") + "}";
+                         ",\"luces\":" + (luzEncendida ? "true" : "false") +
+                         ",\"lcd\":" + (lcdEncendido ? "true" : "false") +
+                         ",\"wifi\":" + (wifiConectado ? "true" : "false") + "}";
         mqttClient.publish(mqtt_topic_pub, mensaje.c_str());
         Serial.println("📤 MQTT: " + mensaje);
       }
       
-      enviarAlBackend(temperaturaActual, bombaEncendida, luzEncendida);
+      // Solo enviar al backend si hay WiFi
+      if (wifiConectado) {
+        enviarAlBackend(temperaturaActual, bombaEncendida, luzEncendida);
+      }
     }
   }
 
-  // Actualizar configuración de luces periódicamente
-  if (ahora - ultimoCheckLuces >= intervaloLucesConfig) {
+  // Actualizar configuración de luces periódicamente (solo si hay WiFi)
+  if (wifiConectado && ahora - ultimoCheckLuces >= intervaloLucesConfig) {
     obtenerConfigLuces();
     ultimoCheckLuces = ahora;
   }
 
-  // Control automático de luces UV
+  // Control automático de luces UV (funciona sin internet si tienes la hora)
   if (lucesConfigRecibida) {
     time_t now = time(nullptr);
-    struct tm* timeinfo = localtime(&now);
-    int hora = timeinfo->tm_hour;
+    if (now > 100000) { // Solo si tenemos hora válida
+      struct tm* timeinfo = localtime(&now);
+      int hora = timeinfo->tm_hour;
 
-    bool debeEstarEncendida = false;
-    if (horaLuzOn <= horaLuzOff) {
-      debeEstarEncendida = (hora >= horaLuzOn && hora < horaLuzOff);
-    } else {
-      debeEstarEncendida = (hora >= horaLuzOn || hora < horaLuzOff);
-    }
+      bool debeEstarEncendida = false;
+      if (horaLuzOn <= horaLuzOff) {
+        debeEstarEncendida = (hora >= horaLuzOn && hora < horaLuzOff);
+      } else {
+        debeEstarEncendida = (hora >= horaLuzOn || hora < horaLuzOff);
+      }
 
-    if (debeEstarEncendida && !luzEncendida) {
-      digitalWrite(LUZ_PIN, LOW);
-      luzEncendida = true;
-      Serial.println("🌙 Luces UV ENCENDIDAS (auto)");
-      registrarEventoLuz(true, "auto", "Encendidas por horario");
-    } else if (!debeEstarEncendida && luzEncendida) {
-      digitalWrite(LUZ_PIN, HIGH);
-      luzEncendida = false;
-      Serial.println("🌤️ Luces UV APAGADAS (auto)");
-      registrarEventoLuz(false, "auto", "Apagadas por horario");
+      if (debeEstarEncendida && !luzEncendida) {
+        digitalWrite(LUZ_PIN, LOW);
+        luzEncendida = true;
+        Serial.println("🌙 Luces UV ENCENDIDAS (auto)");
+        registrarEventoLuz(true, "auto", "Encendidas por horario");
+      } else if (!debeEstarEncendida && luzEncendida) {
+        digitalWrite(LUZ_PIN, HIGH);
+        luzEncendida = false;
+        Serial.println("🌤️ Luces UV APAGADAS (auto)");
+        registrarEventoLuz(false, "auto", "Apagadas por horario");
+      }
     }
   }
 
-  // Actualizar LCD
+  // Actualizar LCD (solo si está encendido)
   actualizarLCD();
 
   delay(100);
