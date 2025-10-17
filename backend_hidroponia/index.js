@@ -153,7 +153,111 @@ app.post("/luces/config", async (req, res) => {
   }
 });
 
+// ✅ POST /limpiar => Limpia registros antiguos automáticamente
+app.post("/limpiar", async (req, res) => {
+  try {
+    console.log("🧹 Iniciando limpieza de base de datos...");
+    
+    // Mantener solo últimos 100 registros
+    const resultRegistros = await pool.query(
+      `DELETE FROM registros 
+       WHERE id NOT IN (
+         SELECT id FROM registros 
+         ORDER BY fecha DESC 
+         LIMIT 100
+       )`
+    );
+    
+    // Mantener solo últimos 50 eventos de luces
+    const resultLuces = await pool.query(
+      `DELETE FROM luces_uv 
+       WHERE id NOT IN (
+         SELECT id FROM luces_uv 
+         ORDER BY fecha DESC 
+         LIMIT 50
+       )`
+    );
+    
+    // Mantener solo última configuración de luces
+    const resultConfig = await pool.query(
+      `DELETE FROM luces_config 
+       WHERE id NOT IN (
+         SELECT id FROM luces_config 
+         ORDER BY fecha DESC 
+         LIMIT 1
+       )`
+    );
+    
+    console.log(`✅ BD limpiada: ${resultRegistros.rowCount} registros, ${resultLuces.rowCount} eventos de luces eliminados`);
+    
+    res.status(200).json({ 
+      status: "base_datos_limpiada",
+      mensaje: "Registros antiguos eliminados correctamente",
+      eliminados: {
+        registros: resultRegistros.rowCount,
+        luces: resultLuces.rowCount,
+        config: resultConfig.rowCount
+      }
+    });
+  } catch (err) {
+    console.error("❌ Error al limpiar BD:", err.message);
+    res.status(500).json({ error: "Error al limpiar base de datos" });
+  }
+});
+
+// ✅ GET /stats => Obtener estadísticas de la BD
+app.get("/stats", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        (SELECT COUNT(*) FROM registros) as total_registros,
+        (SELECT COUNT(*) FROM luces_uv) as total_luces,
+        (SELECT COUNT(*) FROM luces_config) as total_config
+    `);
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("❌ Error al obtener estadísticas:", err.message);
+    res.status(500).json({ error: "Error al obtener estadísticas" });
+  }
+});
+
+// ✅ Limpieza automática cada 6 horas
+setInterval(async () => {
+  try {
+    console.log("🧹 Limpieza automática de BD iniciada...");
+    
+    // Mantener solo últimos 100 registros
+    const result = await pool.query(
+      `DELETE FROM registros 
+       WHERE id NOT IN (
+         SELECT id FROM registros 
+         ORDER BY fecha DESC 
+         LIMIT 100
+       )`
+    );
+    
+    // Mantener solo últimos 50 eventos de luces
+    await pool.query(
+      `DELETE FROM luces_uv 
+       WHERE id NOT IN (
+         SELECT id FROM luces_uv 
+         ORDER BY fecha DESC 
+         LIMIT 50
+       )`
+    );
+    
+    console.log(`✅ Limpieza automática completada: ${result.rowCount} registros eliminados`);
+  } catch (err) {
+    console.error("❌ Error en limpieza automática:", err.message);
+  }
+}, 6 * 60 * 60 * 1000); // Cada 6 horas
+
 // 🚀 Arrancar servidor
 app.listen(port, () => {
   console.log(`🚀 Servidor escuchando en puerto ${port}`);
+  console.log(`🧹 Limpieza automática de BD activada (cada 6 horas)`);
+  console.log(`📊 Endpoints disponibles:`);
+  console.log(`   POST /limpiar - Limpiar BD manualmente`);
+  console.log(`   GET  /stats - Ver estadísticas de BD`);
 });
