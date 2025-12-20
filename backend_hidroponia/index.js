@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -9,10 +11,13 @@ app.use(cors());
 app.use(express.json());
 
 // 📦 Configuración de PostgreSQL desde Supabase
+if (!process.env.DATABASE_URL) {
+  console.error("❌ ERROR: DATABASE_URL no está definida en .env");
+  process.exit(1);
+}
+
 const pool = new Pool({
-  connectionString:
-    process.env.DATABASE_URL ||
-    "postgresql://postgres:Bry%23%40n-2025Agro@db.sfwhafqwazaqoklwmsnh.supabase.co:5432/postgres",
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
